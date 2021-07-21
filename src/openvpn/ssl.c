@@ -5,9 +5,9 @@
  *             packet encryption, packet authentication, and
  *             packet compression.
  *
- *  Copyright (C) 2002-2018 OpenVPN Inc <sales@openvpn.net>
- *  Copyright (C) 2010-2018 Fox Crypto B.V. <openvpn@fox-it.com>
- *  Copyright (C) 2008-2013 David Sommerseth <dazo@users.sourceforge.net>
+ *  Copyright (C) 2002-2021 OpenVPN Inc <sales@openvpn.net>
+ *  Copyright (C) 2010-2021 Fox Crypto B.V. <openvpn@foxcrypto.com>
+ *  Copyright (C) 2008-2021 David Sommerseth <dazo@eurephia.org>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2
@@ -446,6 +446,12 @@ ssl_set_auth_token(const char *token)
     set_auth_token(&auth_user_pass, &auth_token, token);
 }
 
+void
+ssl_set_auth_token_user(const char *username)
+{
+    set_auth_token_user(&auth_token, username);
+}
+
 /*
  * Cleans an auth token and checks if it was active
  */
@@ -781,6 +787,9 @@ state_name(int state)
 
         case S_ERROR:
             return "S_ERROR";
+
+        case S_GENERATED_KEYS:
+            return "S_GENERATED_KEYS";
 
         default:
             return "S_???";
@@ -1834,13 +1843,13 @@ key_ctx_update_implicit_iv(struct key_ctx *ctx, uint8_t *key, size_t key_len)
  * This erases the source material used to generate the data channel keys, and
  * can thus be called only once per session.
  */
-static bool
+bool
 tls_session_generate_data_channel_keys(struct tls_session *session)
 {
     bool ret = false;
     struct key_state *ks = &session->key[KS_PRIMARY];   /* primary key */
 
-    if (ks->authenticated == KS_AUTH_FALSE)
+    if (ks->authenticated <= KS_AUTH_FALSE)
     {
         msg(D_TLS_ERRORS, "TLS Error: key_state not authenticated");
         goto cleanup;
@@ -1855,6 +1864,9 @@ tls_session_generate_data_channel_keys(struct tls_session *session)
     }
     tls_limit_reneg_bytes(session->opt->key_type.cipher,
                           &session->opt->renegotiate_bytes);
+
+    /* set the state of the keys for the session to generated */
+    ks->state = S_GENERATED_KEYS;
 
     ret = true;
 cleanup:
@@ -2310,8 +2322,8 @@ key_method_2_write(struct buffer *buf, struct tls_multi *multi, struct tls_sessi
         }
     }
 
-    /* write username/password if specified */
-    if (auth_user_pass_enabled)
+    /* write username/password if specified or we are using a auth-token */
+    if (auth_user_pass_enabled || (auth_token.token_defined && auth_token.defined))
     {
 #ifdef ENABLE_MANAGEMENT
         auth_user_pass_setup(session->opt->auth_user_pass_file, session->opt->sci);
@@ -2324,7 +2336,7 @@ key_method_2_write(struct buffer *buf, struct tls_multi *multi, struct tls_sessi
          * If we have a valid auth-token, send that instead of real
          * username/password
          */
-        if (auth_token.defined)
+        if (auth_token.token_defined && auth_token.defined)
         {
             up = &auth_token;
         }
@@ -2367,28 +2379,6 @@ key_method_2_write(struct buffer *buf, struct tls_multi *multi, struct tls_sessi
     if (!push_peer_info(buf, session))
     {
         goto error;
-    }
-
-    /*
-     * Generate tunnel keys if we're a TLS server.
-     *
-     * If we're a p2mp server to allow NCP, the first key
-     * generation is postponed until after the connect script finished and the
-     * NCP options can be processed. Since that always happens at after connect
-     * script options are available the CAS_SUCCEEDED status is identical to
-     * NCP options are processed and we have no extra state for NCP finished.
-     */
-    if (session->opt->server && (session->opt->mode != MODE_SERVER
-            || multi->multi_state == CAS_SUCCEEDED))
-    {
-        if (ks->authenticated > KS_AUTH_FALSE)
-        {
-            if (!tls_session_generate_data_channel_keys(session))
-            {
-                msg(D_TLS_ERRORS, "TLS Error: server generate_key_expansion failed");
-                goto error;
-            }
-        }
     }
 
     return true;
@@ -2591,20 +2581,6 @@ key_method_2_read(struct buffer *buf, struct tls_multi *multi, struct tls_sessio
         setenv_del(session->opt->es, "exported_keying_material");
     }
 
-    /*
-     * Generate tunnel keys if we're a client.
-     * If --pull is enabled, the first key generation is postponed until after the
-     * pull/push, so we can process pushed cipher directives.
-     */
-    if (!session->opt->server && (!session->opt->pull || ks->key_id > 0))
-    {
-        if (!tls_session_generate_data_channel_keys(session))
-        {
-            msg(D_TLS_ERRORS, "TLS Error: client generate_key_expansion failed");
-            goto error;
-        }
-    }
-
     gc_free(&gc);
     return true;
 
@@ -2794,6 +2770,21 @@ tls_process(struct tls_multi *multi,
 
                 /* Set outgoing address for data channel packets */
                 link_socket_set_outgoing_addr(to_link_socket_info, &ks->remote_addr, session->common_name, session->opt->es);
+
+                /* Check if we need to advance the tls_multi state machine */
+                if (multi->multi_state == CAS_NOT_CONNECTED)
+                {
+                    if (session->opt->mode == MODE_SERVER)
+                    {
+                        /* On a server we continue with running connect scripts next */
+                        multi->multi_state = CAS_WAITING_AUTH;
+                    }
+                    else
+                    {
+                        /* Skip the connect script related states */
+                        multi->multi_state = CAS_WAITING_OPTIONS_IMPORT;
+                    }
+                }
 
                 /* Flush any payload packets that were buffered before our state transitioned to S_ACTIVE */
                 flush_payload_buffer(ks);
@@ -3112,6 +3103,34 @@ tls_multi_process(struct tls_multi *multi,
 
     enum tls_auth_status tas = tls_authentication_status(multi);
 
+    /* If we have successfully authenticated and are still waiting for the authentication to finish
+     * move the state machine for the multi context forward */
+
+    if (multi->multi_state >= CAS_CONNECT_DONE)
+    {
+        for (int i = 0; i < TM_SIZE; ++i)
+        {
+            struct tls_session *session = &multi->session[i];
+            struct key_state *ks = &session->key[KS_PRIMARY];
+
+            if (ks->state == S_ACTIVE && ks->authenticated == KS_AUTH_TRUE)
+            {
+                /* This will move ks->state from S_ACTIVE to S_GENERATED_KEYS */
+                if (!tls_session_generate_data_channel_keys(session))
+                {
+                    msg(D_TLS_ERRORS, "TLS Error: generate_key_expansion failed");
+                    ks->authenticated = KS_AUTH_FALSE;
+                    ks->state = S_ERROR;
+                }
+            }
+        }
+    }
+
+    if (multi->multi_state == CAS_WAITING_AUTH && tas == TLS_AUTHENTICATION_SUCCEEDED)
+    {
+        multi->multi_state = CAS_PENDING;
+    }
+
     /*
      * If lame duck session expires, kill it.
      */
@@ -3215,11 +3234,10 @@ handle_data_channel_packet(struct tls_multi *multi,
          * passive side is the server which only listens for the connections, the
          * active side is the client which initiates connections).
          */
-        if (TLS_AUTHENTICATED(multi, ks)
-            && key_id == ks->key_id
-            && (ks->authenticated == KS_AUTH_TRUE)
+        if (ks->state >= S_GENERATED_KEYS && key_id == ks->key_id
             && (floated || link_socket_actual_match(from, &ks->remote_addr)))
         {
+            ASSERT(ks->authenticated == KS_AUTH_TRUE);
             if (!ks->crypto_options.key_ctx_bi.initialized)
             {
                 msg(D_MULTI_DROPPED,
@@ -3541,8 +3559,7 @@ tls_pre_decrypt(struct tls_multi *multi,
         /*
          * Remote is requesting a key renegotiation
          */
-        if (op == P_CONTROL_SOFT_RESET_V1
-            && TLS_AUTHENTICATED(multi, ks))
+        if (op == P_CONTROL_SOFT_RESET_V1 && TLS_AUTHENTICATED(multi, ks))
         {
             if (!read_control_auth(buf, &session->tls_wrap, from,
                                    session->opt))
@@ -3803,10 +3820,11 @@ struct key_state *tls_select_encryption_key(struct tls_multi *multi)
     for (int i = 0; i < KEY_SCAN_SIZE; ++i)
     {
         struct key_state *ks = get_key_scan(multi, i);
-        if (ks->state >= S_ACTIVE
-            && ks->authenticated == KS_AUTH_TRUE
-            && ks->crypto_options.key_ctx_bi.initialized)
+        if (ks->state >= S_GENERATED_KEYS)
         {
+            ASSERT(ks->authenticated == KS_AUTH_TRUE);
+            ASSERT(ks->crypto_options.key_ctx_bi.initialized);
+
             if (!ks_select)
             {
                 ks_select = ks;

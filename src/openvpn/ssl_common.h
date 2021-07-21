@@ -5,8 +5,8 @@
  *             packet encryption, packet authentication, and
  *             packet compression.
  *
- *  Copyright (C) 2002-2018 OpenVPN Inc <sales@openvpn.net>
- *  Copyright (C) 2010-2018 Fox Crypto B.V. <openvpn@fox-it.com>
+ *  Copyright (C) 2002-2021 OpenVPN Inc <sales@openvpn.net>
+ *  Copyright (C) 2010-2021 Fox Crypto B.V. <openvpn@foxcrypto.com>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2
@@ -64,7 +64,8 @@
  *      material.
  *   -# \c S_GOT_KEY, have received remote part of \c key_source2 random
  *      material.
- *   -# \c S_ACTIVE, normal operation
+ *   -# \c S_ACTIVE, control channel successfully established
+ *   -# \c S_GENERATED_KEYS, the data channel keys have been generated
  *
  * Servers follow the same order, except for \c S_SENT_KEY and \c
  * S_GOT_KEY being reversed, because the server first receives the
@@ -92,7 +93,9 @@
 #define S_ACTIVE          6     /**< Operational \c key_state state
                                  *   immediately after negotiation has
                                  *   completed while still within the
-                                 *   handshake window. */
+                                 *   handshake window.  Deferred auth and
+                                 *   client connect can still be pending. */
+#define S_GENERATED_KEYS  7     /**< The data channel keys have been generated */
 /* Note that earlier versions also had a S_OP_NORMAL state that was
  * virtually identical with S_ACTIVE and the code still assumes everything
  * >= S_ACTIVE to be fully operational */
@@ -182,6 +185,8 @@ enum auth_deferred_result {
 struct key_state
 {
     int state;
+    /** The state of the auth-token sent from the client */
+    int auth_token_state_flags;
 
     /**
      * Key id for this key_state,  inherited from struct tls_session.
@@ -502,12 +507,20 @@ struct tls_session
 /* client authentication state, CAS_SUCCEEDED must be 0 since
  * non multi code path still checks this variable but does not initialise it
  * so the code depends on zero initialisation */
-enum client_connect_status {
-    CAS_SUCCEEDED=0,
+
+/* CAS_NOT_CONNECTED is the initial state for every context. When the *first*
+ * tls_session reaches S_ACTIVE, this state machine moves to CAS_PENDING (server)
+ * or CAS_CONNECT_DONE (client/p2p) as clients skip the stages associated with
+ * connect scripts/plugins */
+enum multi_status {
+    CAS_NOT_CONNECTED,
+    CAS_WAITING_AUTH,               /**< TLS connection established but deferred auth not finished */
     CAS_PENDING,
     CAS_PENDING_DEFERRED,
     CAS_PENDING_DEFERRED_PARTIAL,   /**< at least handler succeeded, no result yet*/
     CAS_FAILED,
+    CAS_WAITING_OPTIONS_IMPORT,     /**< client with pull or p2p waiting for first time options import */
+    CAS_CONNECT_DONE,
 };
 
 
@@ -546,7 +559,7 @@ struct tls_multi
 
     int n_sessions;             /**< Number of sessions negotiated thus
                                  *   far. */
-    enum client_connect_status multi_state;
+    enum multi_status multi_state;
 
     /*
      * Number of errors.
@@ -598,8 +611,6 @@ struct tls_multi
      * OpenVPN 3 clients sometimes wipes or replaces the username with a
      * username hint from their config.
      */
-    int auth_token_state_flags;
-    /**< The state of the auth-token sent from the client last time */
 
     /* For P_DATA_V2 */
     uint32_t peer_id;

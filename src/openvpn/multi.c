@@ -5,7 +5,7 @@
  *             packet encryption, packet authentication, and
  *             packet compression.
  *
- *  Copyright (C) 2002-2018 OpenVPN Inc <sales@openvpn.net>
+ *  Copyright (C) 2002-2021 OpenVPN Inc <sales@openvpn.net>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2
@@ -674,7 +674,8 @@ multi_close_instance(struct multi_context *m,
 #ifdef ENABLE_MANAGEMENT
     set_cc_config(mi, NULL);
 #endif
-    if (mi->context.c2.tls_multi->multi_state == CAS_SUCCEEDED)
+
+    if (mi->context.c2.tls_multi->multi_state >= CAS_CONNECT_DONE)
     {
         multi_client_disconnect_script(mi);
     }
@@ -775,7 +776,7 @@ multi_create_instance(struct multi_context *m, const struct mroute_addr *real)
         goto err;
     }
 
-    mi->context.c2.tls_multi->multi_state = CAS_PENDING;
+    mi->context.c2.tls_multi->multi_state = CAS_NOT_CONNECTED;
 
     if (hash_n_elements(m->hash) >= m->max_clients)
     {
@@ -2407,7 +2408,7 @@ multi_client_connect_late_setup(struct multi_context *m,
     mi->reporting_addr_ipv6 = mi->context.c2.push_ifconfig_ipv6_local;
 
     /* set context-level authentication flag */
-    mi->context.c2.tls_multi->multi_state = CAS_SUCCEEDED;
+    mi->context.c2.tls_multi->multi_state = CAS_CONNECT_DONE;
 
     /* authentication complete, calculate dynamic client specific options */
     if (!multi_client_set_protocol_options(&mi->context))
@@ -2595,11 +2596,6 @@ static const multi_client_connect_handler client_connect_handlers[] = {
 static void
 multi_connection_established(struct multi_context *m, struct multi_instance *mi)
 {
-    if (tls_authentication_status(mi->context.c2.tls_multi) != TLS_AUTHENTICATION_SUCCEEDED)
-    {
-        return;
-    }
-
     /* We are only called for the CAS_PENDING_x states, so we
      * can ignore other states here */
     bool from_deferred = (mi->context.c2.tls_multi->multi_state != CAS_PENDING);
@@ -2649,9 +2645,9 @@ multi_connection_established(struct multi_context *m, struct multi_instance *mi)
 
             case CC_RET_DEFERRED:
                 /*
-                 * we already set client_connect_status to DEFERRED_RESULT or
+                 * we already set multi_status to DEFERRED_RESULT or
                  * DEFERRED_NO_RESULT. We just return
-                 * from the function as having client_connect_status
+                 * from the function as having multi_status
                  */
                 return;
 
@@ -3003,8 +2999,8 @@ multi_process_post(struct multi_context *m, struct multi_instance *mi, const uns
         {
             /* connection is "established" when SSL/TLS key negotiation succeeds
              * and (if specified) auth user/pass succeeds */
-            if (is_cas_pending(mi->context.c2.tls_multi->multi_state)
-                && CONNECTION_ESTABLISHED(&mi->context))
+
+            if (is_cas_pending(mi->context.c2.tls_multi->multi_state))
             {
                 multi_connection_established(m, mi);
             }
@@ -3969,7 +3965,7 @@ management_client_auth(void *arg,
         {
             if (auth)
             {
-                if (is_cas_pending(mi->context.c2.tls_multi->multi_state))
+                if (mi->context.c2.tls_multi->multi_state <= CAS_WAITING_AUTH)
                 {
                     set_cc_config(mi, cc_config);
                     cc_config_owned = false;

@@ -5,8 +5,8 @@
  *             packet encryption, packet authentication, and
  *             packet compression.
  *
- *  Copyright (C) 2002-2018 OpenVPN Inc <sales@openvpn.net>
- *  Copyright (C) 2010-2018 Fox Crypto B.V. <openvpn@fox-it.com>
+ *  Copyright (C) 2002-2021 OpenVPN Inc <sales@openvpn.net>
+ *  Copyright (C) 2010-2021 Fox Crypto B.V. <openvpn@foxcrypto.com>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2
@@ -1074,6 +1074,60 @@ key_state_test_auth_control_file(struct auth_deferred_status *ads, bool cached)
 }
 
 /**
+ * This method takes a key_state and if updates the state
+ * of the key if it is deferred.
+ * @param cached    If auth control files should be tried to be opened or th
+ *                  cached results should be used
+ * @param ks        The key_state to update
+ */
+static void
+update_key_auth_status(bool cached, struct key_state *ks)
+{
+    if (ks->authenticated == KS_AUTH_FALSE)
+    {
+        return;
+    }
+    else
+    {
+        enum auth_deferred_result auth_plugin = ACF_DISABLED;
+        enum auth_deferred_result auth_script = ACF_DISABLED;
+        enum auth_deferred_result auth_man = ACF_DISABLED;
+        auth_plugin = key_state_test_auth_control_file(&ks->plugin_auth, cached);
+        auth_script = key_state_test_auth_control_file(&ks->script_auth, cached);
+#ifdef ENABLE_MANAGEMENT
+        auth_man = man_def_auth_test(ks);
+#endif
+        ASSERT(auth_plugin < 4 && auth_script < 4 && auth_man < 4);
+
+        if (auth_plugin == ACF_FAILED || auth_script == ACF_FAILED
+           || auth_man == ACF_FAILED)
+        {
+            ks->authenticated = KS_AUTH_FALSE;
+            return;
+        }
+        else if (auth_plugin == ACF_PENDING || auth_script == ACF_PENDING
+                 || auth_man == ACF_PENDING)
+        {
+            if (now >= ks->auth_deferred_expire)
+            {
+                /* Window to authenticate the key has expired, mark
+                 * the key as unauthenticated */
+                ks->authenticated = KS_AUTH_FALSE;
+            }
+        }
+        else
+        {
+            /* all auth states (auth_plugin, auth_script, auth_man)
+             * are either ACF_DISABLED or ACF_SUCCEDED now, which
+             * translates to "not checked" or "auth succeeded"
+             */
+            ks->authenticated = KS_AUTH_TRUE;
+        }
+    }
+}
+
+
+/**
  * The minimum times to have passed to update the cache. Older versions
  * of OpenVPN had code path that did not do any caching, so we start
  * with no caching (0) here as well to have the same super quick initial
@@ -1115,46 +1169,19 @@ tls_authentication_status(struct tls_multi *multi)
         if (TLS_AUTHENTICATED(multi, ks))
         {
             active++;
+            update_key_auth_status(cached, ks);
+
             if (ks->authenticated == KS_AUTH_FALSE)
             {
                 failed_auth = true;
             }
-            else
+            else if (ks->authenticated == KS_AUTH_DEFERRED)
             {
-                enum auth_deferred_result auth_plugin = ACF_DISABLED;
-                enum auth_deferred_result auth_script = ACF_DISABLED;
-                enum auth_deferred_result auth_man = ACF_DISABLED;
-                auth_plugin = key_state_test_auth_control_file(&ks->plugin_auth, cached);
-                auth_script = key_state_test_auth_control_file(&ks->script_auth, cached);
-#ifdef ENABLE_MANAGEMENT
-                auth_man = man_def_auth_test(ks);
-#endif
-                ASSERT(auth_plugin < 4 && auth_script < 4 && auth_man < 4);
-
-                if (auth_plugin == ACF_FAILED || auth_script == ACF_FAILED
-                   || auth_man == ACF_FAILED)
-                {
-                    ks->authenticated = KS_AUTH_FALSE;
-                    failed_auth = true;
-                }
-                else if (auth_plugin == ACF_PENDING
-                         || auth_script == ACF_PENDING
-                         || auth_man == ACF_PENDING)
-                {
-                    if (now < ks->auth_deferred_expire)
-                    {
-                        deferred = true;
-                    }
-                }
-                else
-                {
-                    /* all auth states (auth_plugin, auth_script, auth_man)
-                     * are either ACF_DISABLED or ACF_SUCCEDED now, which
-                     * translates to "not checked" or "auth succeeded"
-                     */
-                    success = true;
-                    ks->authenticated = KS_AUTH_TRUE;
-                }
+                deferred = true;
+            }
+            else if (ks->authenticated == KS_AUTH_TRUE)
+            {
+                success = true;
             }
         }
     }
@@ -1484,7 +1511,7 @@ verify_user_pass(struct user_pass *up, struct tls_multi *multi,
      */
     if (session->opt->auth_token_generate && is_auth_token(up->password))
     {
-        multi->auth_token_state_flags = verify_auth_token(up, multi, session);
+        ks->auth_token_state_flags = verify_auth_token(up, multi, session);
         if (session->opt->auth_token_call_auth)
         {
             /*
@@ -1493,7 +1520,7 @@ verify_user_pass(struct user_pass *up, struct tls_multi *multi,
              * decide what to do with the result
              */
         }
-        else if (multi->auth_token_state_flags == AUTH_TOKEN_HMAC_OK)
+        else if (ks->auth_token_state_flags == AUTH_TOKEN_HMAC_OK)
         {
             /*
              * We do not want the EXPIRED or EMPTY USER flags here so check
@@ -1592,8 +1619,8 @@ verify_user_pass(struct user_pass *up, struct tls_multi *multi,
              * the initial timestamp and session id can be extracted from it
              */
             if (!multi->auth_token
-                && (multi->auth_token_state_flags & AUTH_TOKEN_HMAC_OK)
-                && !(multi->auth_token_state_flags & AUTH_TOKEN_EXPIRED))
+                && (ks->auth_token_state_flags & AUTH_TOKEN_HMAC_OK)
+                && !(ks->auth_token_state_flags & AUTH_TOKEN_EXPIRED))
             {
                 multi->auth_token = strdup(up->password);
             }

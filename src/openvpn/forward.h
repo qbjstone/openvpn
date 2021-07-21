@@ -5,7 +5,7 @@
  *             packet encryption, packet authentication, and
  *             packet compression.
  *
- *  Copyright (C) 2002-2018 OpenVPN Inc <sales@openvpn.net>
+ *  Copyright (C) 2002-2021 OpenVPN Inc <sales@openvpn.net>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2
@@ -411,6 +411,17 @@ io_wait(struct context *c, const unsigned int flags)
     }
 }
 
-#define CONNECTION_ESTABLISHED(c) (get_link_socket_info(c)->connection_established)
+static inline bool
+connection_established(struct context *c)
+{
+    if (c->c2.tls_multi)
+    {
+        return c->c2.tls_multi->multi_state >= CAS_WAITING_OPTIONS_IMPORT;
+    }
+    else
+    {
+        return get_link_socket_info(c)->connection_established;
+    }
+}
 
 #endif /* FORWARD_H */
